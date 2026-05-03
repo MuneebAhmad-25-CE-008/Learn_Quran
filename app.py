@@ -28,15 +28,20 @@ logger = logging.getLogger(__name__)
 CACHE_DIR = Path("./data/quran_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+_JSDELIVR_BASE = "https://cdn.jsdelivr.net/gh/fawazahmed0/quran-api@1/editions"
+_GITHUB_RAW_BASE = "https://raw.githubusercontent.com/fawazahmed0/quran-api/1/editions"
+
 EDITIONS = {
     "arabic": {
-        "name": "ara-uthmani",
-        "url": "https://cdn.jsdelivr.net/gh/fawazahmed0/quran-api@1/editions/ara-uthmani/complete.json",
-        "cache": CACHE_DIR / "ara-uthmani.json",
+        "name": "ar.quran-uthmani",
+        "url": f"{_JSDELIVR_BASE}/ar.quran-uthmani.json",
+        "fallback_url": f"{_GITHUB_RAW_BASE}/ar.quran-uthmani.json",
+        "cache": CACHE_DIR / "ar.quran-uthmani.json",
     },
     "urdu": {
         "name": "ur.jalandhry",
-        "url": "https://cdn.jsdelivr.net/gh/fawazahmed0/quran-api@1/editions/ur.jalandhry/complete.json",
+        "url": f"{_JSDELIVR_BASE}/ur.jalandhry.json",
+        "fallback_url": f"{_GITHUB_RAW_BASE}/ur.jalandhry.json",
         "cache": CACHE_DIR / "ur.jalandhry.json",
     },
 }
@@ -52,24 +57,40 @@ _editions_error: Optional[str] = None
 _editions_lock = threading.Lock()  # prevents duplicate downloads on concurrent requests
 
 
-def _download_edition(name: str, url: str, cache_path: Path) -> dict:
-    """Return edition JSON from disk cache, or download and cache it."""
+def _download_edition(name: str, url: str, cache_path: Path, fallback_url: Optional[str] = None) -> dict:
+    """Return edition JSON from disk cache, or download and cache it.
+
+    If the primary *url* raises a :class:`requests.RequestException` (e.g. 403/404),
+    and *fallback_url* is provided, that URL is tried before propagating the error.
+    """
     if cache_path.exists():
         logger.info("Loading %s from cache: %s", name, cache_path)
         with open(cache_path, "r", encoding="utf-8") as fh:
             return json.load(fh)
 
-    logger.info("Downloading %s from %s", name, url)
-    try:
-        resp = requests.get(url, timeout=60)
-        resp.raise_for_status()
-        data = resp.json()
-        with open(cache_path, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False)
-        return data
-    except requests.RequestException as exc:
-        logger.error("Failed to download %s: %s", name, exc)
-        raise
+    candidate_urls = [url]
+    if fallback_url:
+        candidate_urls.append(fallback_url)
+
+    last_exc: Optional[Exception] = None
+    for attempt_url in candidate_urls:
+        logger.info("Downloading %s from %s", name, attempt_url)
+        try:
+            resp = requests.get(attempt_url, timeout=60)
+            resp.raise_for_status()
+            data = resp.json()
+            with open(cache_path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False)
+            return data
+        except requests.RequestException as exc:
+            logger.error("Failed to download %s from %s: %s", name, attempt_url, exc)
+            last_exc = exc
+            if attempt_url != url or fallback_url is None:
+                break
+            logger.info("Trying fallback URL for %s", name)
+
+    assert last_exc is not None
+    raise last_exc
 
 
 def _build_lookup(data: dict) -> dict:
@@ -102,6 +123,7 @@ def ensure_editions_loaded() -> bool:
                 "Arabic Uthmani",
                 EDITIONS["arabic"]["url"],
                 EDITIONS["arabic"]["cache"],
+                EDITIONS["arabic"].get("fallback_url"),
             )
             _arabic_lookup = _build_lookup(arabic_data)
 
@@ -109,6 +131,7 @@ def ensure_editions_loaded() -> bool:
                 "Urdu Jalandhari",
                 EDITIONS["urdu"]["url"],
                 EDITIONS["urdu"]["cache"],
+                EDITIONS["urdu"].get("fallback_url"),
             )
             _urdu_lookup = _build_lookup(urdu_data)
 
