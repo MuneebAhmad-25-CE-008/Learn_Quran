@@ -7,8 +7,10 @@ FastAPI routes /ready and /chat are mounted alongside a Gradio UI at /.
 import os
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote as url_quote
 
 import requests
 from fastapi import FastAPI, HTTPException
@@ -43,10 +45,11 @@ ALQURAN_SEARCH_URL = "https://api.alquran.cloud/v1/search/{word}/all/ar"
 
 # ─── Lazy-load state ────────────────────────────────────────────────────────
 
-_arabic_lookup: dict = {}   # (surah, ayah) -> arabic text
-_urdu_lookup: dict = {}     # (surah, ayah) -> urdu text
+_arabic_lookup: dict[tuple[int, int], str] = {}   # (surah, ayah) -> arabic text
+_urdu_lookup: dict[tuple[int, int], str] = {}     # (surah, ayah) -> urdu text
 _editions_loaded: bool = False
 _editions_error: Optional[str] = None
+_editions_lock = threading.Lock()  # prevents duplicate downloads on concurrent requests
 
 
 def _download_edition(name: str, url: str, cache_path: Path) -> dict:
@@ -89,30 +92,35 @@ def ensure_editions_loaded() -> bool:
     if _editions_loaded:
         return True
 
-    try:
-        arabic_data = _download_edition(
-            "Arabic Uthmani",
-            EDITIONS["arabic"]["url"],
-            EDITIONS["arabic"]["cache"],
-        )
-        _arabic_lookup = _build_lookup(arabic_data)
+    with _editions_lock:
+        # Re-check inside the lock in case another thread loaded while we waited.
+        if _editions_loaded:
+            return True
 
-        urdu_data = _download_edition(
-            "Urdu Jalandhari",
-            EDITIONS["urdu"]["url"],
-            EDITIONS["urdu"]["cache"],
-        )
-        _urdu_lookup = _build_lookup(urdu_data)
+        try:
+            arabic_data = _download_edition(
+                "Arabic Uthmani",
+                EDITIONS["arabic"]["url"],
+                EDITIONS["arabic"]["cache"],
+            )
+            _arabic_lookup = _build_lookup(arabic_data)
 
-        _editions_loaded = True
-        _editions_error = None
-        logger.info("Editions loaded: %d verses", len(_arabic_lookup))
-        return True
+            urdu_data = _download_edition(
+                "Urdu Jalandhari",
+                EDITIONS["urdu"]["url"],
+                EDITIONS["urdu"]["cache"],
+            )
+            _urdu_lookup = _build_lookup(urdu_data)
 
-    except Exception as exc:  # noqa: BLE001
-        _editions_error = str(exc)
-        logger.error("Failed to load editions: %s", exc)
-        return False
+            _editions_loaded = True
+            _editions_error = None
+            logger.info("Editions loaded: %d verses", len(_arabic_lookup))
+            return True
+
+        except (requests.RequestException, json.JSONDecodeError, OSError) as exc:
+            _editions_error = str(exc)
+            logger.error("Failed to load editions: %s", exc)
+            return False
 
 
 # Attempt a non-fatal background preload so the first /chat is faster.
@@ -155,7 +163,7 @@ def _search_word_alquran(word: str) -> list[str]:
     Falls back to [] on any network/API error.
     """
     try:
-        url = ALQURAN_SEARCH_URL.format(word=requests.utils.quote(word))
+        url = ALQURAN_SEARCH_URL.format(word=url_quote(word))
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()
         data = resp.json()
@@ -229,11 +237,13 @@ SYSTEM_PROMPT = (
 def ready() -> dict:
     """Health / readiness check."""
     groq_key = os.getenv("GROQ_API_KEY")
+    # Avoid exposing raw exception messages from internal systems.
+    has_editions_error = _editions_error is not None
     return {
         "status": "ok",
         "groq_key_configured": bool(groq_key),
         "editions_loaded": _editions_loaded,
-        "editions_error": _editions_error,
+        "editions_error": has_editions_error,
         "verse_count": len(_arabic_lookup),
     }
 
@@ -258,15 +268,35 @@ def chat(req: ChatRequest) -> ChatResponse:
 
     user_message = f"Context:\n{context}\n\nQuestion: {req.message}"
 
-    completion = client.chat.completions.create(
-        model="llama3-8b-8192",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ],
-        max_tokens=512,
-        temperature=0.3,
-    )
+    try:
+        completion = client.chat.completions.create(
+            model="llama3-8b-8192",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_message},
+            ],
+            max_tokens=512,
+            temperature=0.3,
+        )
+    except Exception as exc:  # noqa: BLE001 — groq SDK may raise various errors
+        logger.error("Groq API error: %s", exc)
+        # Provide a more specific message for common failure modes.
+        detail = "Failed to get a response from the language model. Please try again."
+        status = 502
+        exc_name = type(exc).__name__
+        if "Authentication" in exc_name or "auth" in exc_name.lower():
+            detail = "Invalid GROQ_API_KEY. Please check your Space secret."
+            status = 401
+        elif "RateLimit" in exc_name:
+            detail = "Rate limit reached. Please wait a moment and try again."
+            status = 429
+        raise HTTPException(status_code=status, detail=detail) from exc
+
+    if not completion.choices or completion.choices[0].message.content is None:
+        raise HTTPException(
+            status_code=502,
+            detail="The language model returned an empty response. Please try again.",
+        )
     response_text = completion.choices[0].message.content
     return ChatResponse(response=response_text, citations=citations)
 
