@@ -89,9 +89,7 @@ def _download_edition(name: str, url: str, cache_path: Path, fallback_url: Optio
                 break
             logger.info("Trying fallback URL for %s", name)
 
-    if last_exc is None:
-        raise RuntimeError(f"Failed to download {name} with no exception recorded")
-    raise last_exc
+    raise last_exc  # always set: loop only exits via break after an exception
 
 
 def _build_lookup(data: dict) -> dict:
