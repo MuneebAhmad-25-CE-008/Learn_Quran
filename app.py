@@ -85,11 +85,12 @@ def _download_edition(name: str, url: str, cache_path: Path, fallback_url: Optio
         except requests.RequestException as exc:
             logger.error("Failed to download %s from %s: %s", name, attempt_url, exc)
             last_exc = exc
-            if attempt_url != url or fallback_url is None:
+            if attempt_url == fallback_url or fallback_url is None:
                 break
             logger.info("Trying fallback URL for %s", name)
 
-    assert last_exc is not None
+    if last_exc is None:
+        raise RuntimeError(f"Failed to download {name} with no exception recorded")
     raise last_exc
 
 
