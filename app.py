@@ -353,7 +353,7 @@ def _chat_ui(message: str, ayah_ref: str, target_word: str):
         return "❌ An error occurred. Please try again.", "", _status_text()
 
 
-with gr.Blocks(title="Learn Quran — AI Study Assistant", theme=gr.themes.Soft()) as demo:
+with gr.Blocks(title="Learn Quran — AI Study Assistant") as demo:
     gr.Markdown("# 📖 Learn Quran — AI Study Assistant")
     gr.Markdown(
         "Ask questions about the Quran. "
